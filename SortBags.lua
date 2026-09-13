@@ -108,12 +108,12 @@ local CLASSES = {
 	-- arrow
 	{
 		containers = {2101, 5439, 7278, 11362, 3573, 3605, 7371, 8217, 2662, 19319, 18714},
-		items = set(2512, 2515, 3030, 3464, 9399, 11285, 12654, 18042, 19316),
+		items = set(2512, 2515, 42198, 3030, 3464, 9399, 10579, 11285, 42200, 42201, 12654, 18042, 19316),
 	},
 	-- bullet
 	{
 		containers = {2102, 5441, 7279, 11363, 3574, 3604, 7372, 8218, 2663, 19320},
-		items = set(2516, 2519, 3033, 3465, 4960, 5568, 8067, 8068, 8069, 10512, 10513, 11284, 11630, 13377, 15997, 19317),
+		items = set(2516, 4960, 8067, 2519, 5568, 8068, 3033, 8069, 3034, 3465, 10512, 11284, 10513, 11630, 19317, 15997, 13377),
 	},
 	-- soul
 	{
@@ -140,6 +140,140 @@ local defaultDelay = .2
 if IsPlayingOnTurtleWoW() then
 	-- https://turtle-wow.org/bug-report?id=2395
 	defaultDelay = 1.2
+end
+
+local OUTFIT_ITEM_ALIASES = {
+	[18608] = 18609, -- Benediction -> Anathema
+	[18609] = 18608, -- Anathema -> Benediction
+	[17223] = 17074, -- Thunderstrike -> Shadowstrike
+	[17074] = 17223, -- Shadowstrike -> Thunderstrike
+}
+
+local OUTFIT_SLOT_ORDER = {
+	HeadSlot = 1,
+	ShoulderSlot = 2,
+	ChestSlot = 3,
+	WristSlot = 4,
+	HandsSlot = 5,
+	WaistSlot = 6,
+	LegsSlot = 7,
+	FeetSlot = 8,
+	MainHandSlot = 9,
+	TwoHandSlot = 9,
+	Weapon0Slot = 9,
+	SecondaryHandSlot = 10,
+	Weapon1Slot = 10,
+	RangedSlot = 11,
+	AmmoSlot = 12,
+	BackSlot = 13,
+	NeckSlot = 14,
+	ShirtSlot = 15,
+	TabardSlot = 16,
+	Finger0Slot = 17,
+	Finger1Slot = 18,
+	Trinket0Slot = 19,
+	Trinket1Slot = 20,
+}
+
+local LookupOutfitSort, BuildOutfitSortMap
+do
+	local outfitExactMap, outfitLooseMap
+
+	local function registerOutfitItem(itemCode, enchantCode, subCode, info)
+		itemCode = tonumber(itemCode)
+		if not itemCode then
+			return
+		end
+		enchantCode = tonumber(enchantCode) or 0
+		subCode = tonumber(subCode) or 0
+
+		local exactKey = format('%s:%s:%s', itemCode, enchantCode, subCode)
+		local looseKey = format('%s:%s', itemCode, subCode)
+		if not outfitExactMap[exactKey] then
+			outfitExactMap[exactKey] = info
+		end
+		if not outfitLooseMap[looseKey] then
+			outfitLooseMap[looseKey] = info
+		end
+
+		local altCode = OUTFIT_ITEM_ALIASES[itemCode]
+		if altCode then
+			local altExactKey = format('%s:%s:%s', altCode, enchantCode, subCode)
+			local altLooseKey = format('%s:%s', altCode, subCode)
+			if not outfitExactMap[altExactKey] then
+				outfitExactMap[altExactKey] = info
+			end
+			if not outfitLooseMap[altLooseKey] then
+				outfitLooseMap[altLooseKey] = info
+			end
+		end
+	end
+
+	function BuildOutfitSortMap()
+		outfitExactMap, outfitLooseMap = {}, {}
+
+		if not (Outfitter_IsInitialized and Outfitter_IsInitialized()) then
+			return
+		end
+		if not Outfitter_GetOutfitsByCategoryID then
+			return
+		end
+
+		local categories
+		if Outfitter_GetCategoryOrder then
+			categories = Outfitter_GetCategoryOrder()
+		else
+			categories = {'Complete', 'Partial', 'Accessory', 'Special'}
+		end
+
+		local outfitIndex = 0
+		for i = 1, table.getn(categories) do
+			local outfits = Outfitter_GetOutfitsByCategoryID(categories[i])
+			if outfits then
+				local list = {}
+				for _, outfit in outfits do
+					tinsert(list, outfit)
+				end
+				sort(list, function(a, b)
+					return (a.Name or '') < (b.Name or '')
+				end)
+
+				for j = 1, table.getn(list) do
+					local outfit = list[j]
+					if outfit.Items then
+						local hasItems
+						for _, item in outfit.Items do
+							if item.Code and item.Code ~= 0 then
+								hasItems = true
+								break
+							end
+						end
+						if hasItems then
+							outfitIndex = outfitIndex + 1
+							for slotName, item in outfit.Items do
+								if item.Code and item.Code ~= 0 then
+									registerOutfitItem(item.Code, item.EnchantCode, item.SubCode, {
+										outfitIndex,
+										OUTFIT_SLOT_ORDER[slotName] or 99,
+									})
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	function LookupOutfitSort(itemID, enchantID, suffixID)
+		if not outfitExactMap then
+			return
+		end
+		enchantID = tonumber(enchantID) or 0
+		suffixID = tonumber(suffixID) or 0
+		return outfitExactMap[format('%s:%s:%s', itemID, enchantID, suffixID)]
+			or outfitLooseMap[format('%s:%s', itemID, suffixID)]
+	end
 end
 
 local model, itemStacks, itemClasses, itemSortKeys
@@ -340,6 +474,7 @@ do
 
 	function Initialize()
 		model, counts, itemStacks, itemClasses, itemSortKeys = {}, {}, {}, {}, {}
+		BuildOutfitSortMap()
 
 		for _, container in CONTAINERS do
 			local class = ContainerClass(container)
@@ -419,12 +554,14 @@ function Item(container, position)
 		itemID = tonumber(itemID)
 		local _, _, quality, _, type, subType, stack, invType = GetItemInfo(itemID)
 		local charges, usable, soulbound, quest, conjured = TooltipInfo(container, position)
+		local outfitInfo = LookupOutfitSort(itemID, enchantID, suffixID)
 
 		local sortKey = {}
 
-		-- hearthstone
-		if itemID == 6948 then
+		-- hearthstone and related
+		if itemID == 6948 or itemID == 41915 or itemID == 61000 then
 			tinsert(sortKey, 1)
+			tinsert(sortKey, itemID)
 
 		-- mounts
 		elseif MOUNTS[itemID] then
@@ -450,9 +587,16 @@ function Item(container, position)
 		elseif conjured then
 			tinsert(sortKey, 15)
 
+		-- Outfitter outfit items
+		elseif outfitInfo then
+			tinsert(sortKey, 6)
+			tinsert(sortKey, outfitInfo[1])
+			tinsert(sortKey, outfitInfo[2])
+
 		-- soulbound items
 		elseif soulbound then
 			tinsert(sortKey, 6)
+			tinsert(sortKey, 10000)
 
 		-- reagents
 		elseif type == ITEM_TYPES[9] then
