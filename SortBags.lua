@@ -13,13 +13,119 @@ local function IsSuperWoWLoaded()
 	return SetAutoloot ~= nil
 end
 
+local function IsNampowerLoaded()
+	-- https://github.com/Emyrk/nampower
+	return GetNampowerVersion ~= nil
+end
+
+-- Vanilla 1.12 has no bit library
+local function HasFlag(value, flag)
+	return value and mod(floor(value / flag), 2) == 1
+end
+
+-- GetBagItem returns a reusable table; copy scalars immediately
+local function SnapshotBagItem(container, position)
+	if not IsNampowerLoaded() then
+		return
+	end
+	local info = GetBagItem(container, position)
+	if not info then
+		return
+	end
+	return {
+		itemId = info.itemId,
+		stackCount = info.stackCount,
+		spellChargesRemaining = info.spellChargesRemaining,
+		flags = info.flags,
+		permanentEnchantId = info.permanentEnchantId,
+		randomPropertiesId = info.randomPropertiesId,
+	}
+end
+
 local function GetContainerItemCount(container, position)
+	if IsNampowerLoaded() then
+		local info = GetBagItem(container, position)
+		if info and info.stackCount then
+			return info.stackCount
+		end
+	end
 	local _, countOrCharges = GetContainerItemInfo(container, position)
 	local count = countOrCharges
 	if IsSuperWoWLoaded() and countOrCharges < 0 then
 		count = 1
 	end
 	return count
+end
+
+-- CLASSES array index -> ItemBagFamily.dbc id (nampower unifies both)
+local CLASSES_INDEX_TO_FAMILY = {
+	[1] = 1, -- arrows
+	[2] = 2, -- bullets
+	[3] = 3, -- soul shards
+	[4] = 7, -- enchanting
+	[5] = 6, -- herbs
+}
+
+-- Container (DBC class 1) subclass -> family when bagFamily is 0
+-- Stock 1.12: Soul/Herb/Enchanting/Engineering
+-- Turtle extras: Mining/Leather/Meat/Fish
+local CONTAINER_SUBCLASS_FAMILY = {
+	[1] = 3,  -- soul
+	[2] = 6,  -- herb
+	[3] = 7,  -- enchanting
+	[4] = 8,  -- engineering
+	[5] = 10, -- gem (TBC)
+	[6] = 13, -- mining (Turtle; TBC mining is 11)
+	[7] = 12, -- leather
+	[8] = 10, -- meat (Turtle)
+	[9] = 11, -- fish (Turtle)
+}
+
+-- Quiver (DBC class 11) subclass -> family
+local QUIVER_SUBCLASS_FAMILY = {
+	[2] = 1, -- quiver / arrows
+	[3] = 2, -- ammo pouch / bullets
+}
+
+-- Equipped bags: never trust bagFamily (1.12 often 0, sometimes garbage).
+-- Generic bags are Container subclass 0; only subclass 1+ is specialty.
+local function GetNampowerBagFamily(itemID)
+	if not itemID then
+		return
+	end
+	local itemClass = tonumber(GetItemStatsField(itemID, 'class'))
+	local subclass = tonumber(GetItemStatsField(itemID, 'subclass'))
+	if not subclass or subclass == 0 then
+		return
+	end
+	if itemClass == 1 then
+		return CONTAINER_SUBCLASS_FAMILY[subclass]
+	end
+	if itemClass == 11 then
+		return QUIVER_SUBCLASS_FAMILY[subclass]
+	end
+end
+
+-- Loot items: bagFamily is the real routing key. Ignore unknown/garbage values
+-- so ordinary items are not treated as specialty-only.
+local KNOWN_BAG_FAMILIES = {
+	[1] = true, [2] = true, [3] = true,
+	[6] = true, [7] = true, [8] = true, [9] = true,
+	[10] = true, [11] = true, [12] = true, [13] = true,
+}
+
+local function GetNampowerItemFamily(itemID)
+	if not itemID then
+		return
+	end
+	local family = tonumber(GetItemStatsField(itemID, 'bagFamily'))
+	if family and KNOWN_BAG_FAMILIES[family] then
+		return family
+	end
+end
+
+local function NampowerClassFromClassesIndex(class)
+	return CLASSES_INDEX_TO_FAMILY[class] or class
 end
 
 local CONTAINERS
@@ -30,6 +136,10 @@ function _G.SortBags()
 end
 
 function _G.SortBankBags()
+	if GetContainerNumSlots(BANK_CONTAINER) == 0 then
+		DEFAULT_CHAT_FRAME:AddMessage('SortBags: bank is not open')
+		return
+	end
 	CONTAINERS = {-1, 5, 6, 7, 8, 9, 10}
 	Start()
 end
@@ -283,11 +393,12 @@ do
 	f:Hide()
 
 	local timeout
+	local initialized
 
 	function Start()
 		if f:IsShown() then return end
-		Initialize()
-		timeout = GetTime() + 7
+		initialized = false
+		timeout = GetTime() + 35 * defaultDelay
 		f:Show()
 	end
 
@@ -297,8 +408,24 @@ do
 		if delay <= 0 then
 			delay = defaultDelay
 
+			if not initialized then
+				if not Initialize() then
+					if GetTime() > timeout then
+						DEFAULT_CHAT_FRAME:AddMessage('SortBags: sorting incomplete, please run again')
+						f:Hide()
+					end
+					return
+				end
+				initialized = true
+			end
+
 			local complete = Sort()
-			if complete or GetTime() > timeout then
+			if complete then
+				f:Hide()
+				return
+			end
+			if GetTime() > timeout then
+				DEFAULT_CHAT_FRAME:AddMessage('SortBags: sorting incomplete, please run again')
 				f:Hide()
 				return
 			end
@@ -321,11 +448,11 @@ do
 	end
 
 	function ItemSubTypeKey(itemClass, itemSubClass)
-		return key({GetAuctionItemSubClasses(ItemTypeKey(itemClass))}, itemClass) or 0
+		return key({GetAuctionItemSubClasses(ItemTypeKey(itemClass))}, itemSubClass) or 0
 	end
 
 	function ItemInvTypeKey(itemClass, itemSubClass, itemSlot)
-		return key({GetAuctionInvTypes(ItemTypeKey(itemClass), ItemSubTypeKey(itemSubClass))}, itemSlot) or 0
+		return key({GetAuctionInvTypes(ItemTypeKey(itemClass), ItemSubTypeKey(itemClass, itemSubClass))}, itemSlot) or 0
 	end
 end
 
@@ -368,9 +495,28 @@ function Move(src, dst)
     end
 end
 
-function TooltipInfo(container, position)
-	local chargesPattern = '^' .. gsub(gsub(ITEM_SPELL_CHARGES_P1, '%%d', '(%%d+)'), '%%%d+%$d', '(%%d+)') .. '$'
+local function MakeChargesPattern(template)
+	if not template then
+		return
+	end
+	return '^' .. gsub(gsub(template, '%%d', '(%%d+)'), '%%%d+%$d', '(%%d+)') .. '$'
+end
 
+local CHARGES_PATTERNS = {}
+do
+	local p1 = MakeChargesPattern(ITEM_SPELL_CHARGES_P1)
+	if p1 then
+		tinsert(CHARGES_PATTERNS, p1)
+	end
+	if ITEM_SPELL_CHARGES and ITEM_SPELL_CHARGES ~= ITEM_SPELL_CHARGES_P1 then
+		local p = MakeChargesPattern(ITEM_SPELL_CHARGES)
+		if p then
+			tinsert(CHARGES_PATTERNS, p)
+		end
+	end
+end
+
+function TooltipInfo(container, position)
 	SortBagsTooltip:SetOwner(UIParent, 'ANCHOR_NONE')
 	SortBagsTooltip:ClearLines()
 
@@ -383,22 +529,69 @@ function TooltipInfo(container, position)
 	local charges, usable, soulbound, quest, conjured
 	for i = 1, SortBagsTooltip:NumLines() do
 		local text = getglobal('SortBagsTooltipTextLeft' .. i):GetText()
-
-		local _, _, chargeString = strfind(text, chargesPattern)
-		if chargeString then
-			charges = tonumber(chargeString)
-		elseif strfind(text, '^' .. ITEM_SPELL_TRIGGER_ONUSE) then
-			usable = true
-		elseif text == ITEM_SOULBOUND then
-			soulbound = true
-		elseif text == ITEM_BIND_QUEST then
-			quest = true
-		elseif text == ITEM_CONJURED then
-			conjured = true
+		if text then
+			local chargeString
+			for _, pattern in CHARGES_PATTERNS do
+				local _, _, match = strfind(text, pattern)
+				if match then
+					chargeString = match
+					break
+				end
+			end
+			if chargeString then
+				charges = tonumber(chargeString)
+			elseif strfind(text, '^' .. ITEM_SPELL_TRIGGER_ONUSE) then
+				usable = true
+			elseif text == ITEM_SOULBOUND then
+				soulbound = true
+			elseif text == ITEM_BIND_QUEST then
+				quest = true
+			elseif text == ITEM_CONJURED then
+				conjured = true
+			end
 		end
 	end
 
 	return charges or 1, usable, soulbound, quest, conjured
+end
+
+local function NampowerItemInfo(bagItem, itemID)
+	local instanceFlags = bagItem.flags or 0
+	local dbcFlags = GetItemStatsField(itemID, 'flags') or 0
+	local bonding = GetItemStatsField(itemID, 'bonding')
+
+	local soulbound = HasFlag(instanceFlags, 1) or bonding == 1
+	local quest = bonding == 4 or bonding == 5
+	local conjured = HasFlag(dbcFlags, 2)
+
+	local usable
+	local spellIDs = GetItemStatsField(itemID, 'spellID', 1)
+	local spellTriggers = GetItemStatsField(itemID, 'spellTrigger', 1)
+	if spellIDs and spellTriggers then
+		for i = 1, 5 do
+			if spellIDs[i] and spellIDs[i] ~= 0 and spellTriggers[i] == 0 then
+				usable = true
+				break
+			end
+		end
+	end
+
+	local charges = 1
+	local spellCharges = GetItemStatsField(itemID, 'spellCharges', 1)
+	local hasCharges
+	if spellCharges then
+		for i = 1, 5 do
+			if spellCharges[i] and spellCharges[i] ~= 0 then
+				hasCharges = true
+				break
+			end
+		end
+	end
+	if hasCharges then
+		charges = abs(bagItem.spellChargesRemaining or 0)
+	end
+
+	return charges, usable, soulbound, quest, conjured
 end
 
 function Sort()
@@ -439,7 +632,9 @@ function Stack()
 		if src.item and src.count < itemStacks[src.item] and src.item ~= src.targetItem then
 			for _, dst in model do
 				if dst ~= src and dst.item and dst.item == src.item and dst.count < itemStacks[dst.item] and dst.item ~= dst.targetItem then
-					Move(src, dst)
+					if Move(src, dst) then
+						return
+					end
 				end
 			end
 		end
@@ -480,7 +675,14 @@ do
 			local class = ContainerClass(container)
 			for position = 1, GetContainerNumSlots(container) do
 				local slot = {container=container, position=position, class=class}
+				local texture, _, locked = GetContainerItemInfo(container, position)
+				if texture and locked then
+					return false
+				end
 				local item = Item(container, position)
+				if item == false then
+					return false
+				end
 				if item then
 					local count = GetContainerItemCount(container, position)
 					slot.item = item
@@ -529,19 +731,35 @@ do
 				end
 			end
 		end
+
+		return true
 	end
 end
 
 function ContainerClass(container)
 	if container ~= 0 and container ~= BANK_CONTAINER then
+		if IsNampowerLoaded() then
+			local invID = ContainerIDToInventoryID(container)
+			local bagLink = invID and GetInventoryItemLink('player', invID)
+			if bagLink then
+				local _, _, bagItemID = strfind(bagLink, 'item:(%d+)')
+				local family = GetNampowerBagFamily(tonumber(bagItemID))
+				if family then
+					return family
+				end
+			end
+		end
 		local name = GetBagName(container)
-		if name then		
+		if name then
 			for class, info in CLASSES do
 				for _, itemID in info.containers do
 					if name == GetItemInfo(itemID) then
+						if IsNampowerLoaded() then
+							return NampowerClassFromClassesIndex(class)
+						end
 						return class
 					end
-				end	
+				end
 			end
 		end
 	end
@@ -552,8 +770,24 @@ function Item(container, position)
 	if link then
 		local _, _, itemID, enchantID, suffixID, uniqueID = strfind(link, 'item:(%d+):(%d*):(%d*):(%d*)')
 		itemID = tonumber(itemID)
-		local _, _, quality, _, type, subType, stack, invType = GetItemInfo(itemID)
-		local charges, usable, soulbound, quest, conjured = TooltipInfo(container, position)
+		local name, _, quality, _, type, subType, stack, invType = GetItemInfo(itemID)
+		if not name then
+			return false
+		end
+
+		local charges, usable, soulbound, quest, conjured
+		local bagItem = SnapshotBagItem(container, position)
+		if bagItem then
+			charges, usable, soulbound, quest, conjured = NampowerItemInfo(bagItem, itemID)
+			if (not enchantID or enchantID == '') and bagItem.permanentEnchantId and bagItem.permanentEnchantId ~= 0 then
+				enchantID = tostring(bagItem.permanentEnchantId)
+			end
+			if (not suffixID or suffixID == '') and bagItem.randomPropertiesId and bagItem.randomPropertiesId ~= 0 then
+				suffixID = tostring(bagItem.randomPropertiesId)
+			end
+		else
+			charges, usable, soulbound, quest, conjured = TooltipInfo(container, position)
+		end
 		local outfitInfo = LookupOutfitSort(itemID, enchantID, suffixID)
 
 		local sortKey = {}
@@ -630,7 +864,7 @@ function Item(container, position)
 		elseif quality == 0 then
 			tinsert(sortKey, 14)
 		end
-		
+
 		tinsert(sortKey, ItemTypeKey(type))
 		tinsert(sortKey, ItemInvTypeKey(type, subType, invType))
 		tinsert(sortKey, ItemSubTypeKey(type, subType))
@@ -646,10 +880,22 @@ function Item(container, position)
 		itemStacks[key] = stack
 		itemSortKeys[key] = sortKey
 
-		for class, info in CLASSES do
-			if info.items[itemID] then
-				itemClasses[key] = class
-				break
+		if IsNampowerLoaded() then
+			local family = GetNampowerItemFamily(itemID)
+			if family then
+				itemClasses[key] = family
+			end
+		end
+		if not itemClasses[key] then
+			for class, info in CLASSES do
+				if info.items[itemID] then
+					if IsNampowerLoaded() then
+						itemClasses[key] = NampowerClassFromClassesIndex(class)
+					else
+						itemClasses[key] = class
+					end
+					break
+				end
 			end
 		end
 
