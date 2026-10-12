@@ -18,6 +18,28 @@ local function IsNampowerLoaded()
 	return GetNampowerVersion ~= nil
 end
 
+-- Set SortBagsNoClassicAPI to force the cursor/tooltip path.
+local usingClassicAPI
+local sorting
+
+local function HasClassicAPI()
+	if SortBagsNoClassicAPI then
+		return false
+	end
+	return C_Container
+		and C_Container.SwapItems
+		and C_Container.MoveItem
+		and C_Container.GetContainerItemInfo
+		and C_Item
+		and C_Item.GetItemDataByID
+		and C_Item.GetItemFamily
+		and true
+end
+
+local function ItemKey(itemID, enchantID, suffixID, uniqueID, charges, soulbound)
+	return format('%s:%s:%s:%s:%s:%s', itemID, enchantID, suffixID, uniqueID, charges, soulbound and 1 or 0)
+end
+
 -- Vanilla 1.12 has no bit library
 local function HasFlag(value, flag)
 	return value and mod(floor(value / flag), 2) == 1
@@ -43,6 +65,12 @@ local function SnapshotBagItem(container, position)
 end
 
 local function GetContainerItemCount(container, position)
+	if usingClassicAPI then
+		local info = C_Container.GetContainerItemInfo(container, position)
+		if info and info.stackCount then
+			return info.stackCount
+		end
+	end
 	if IsNampowerLoaded() then
 		local info = GetBagItem(container, position)
 		if info and info.stackCount then
@@ -129,9 +157,11 @@ local function NampowerClassFromClassesIndex(class)
 end
 
 local CONTAINERS
+local sortingBank
 
 function _G.SortBags()
 	CONTAINERS = {0, 1, 2, 3, 4}
+	sortingBank = false
 	Start()
 end
 
@@ -141,6 +171,7 @@ function _G.SortBankBags()
 		return
 	end
 	CONTAINERS = {-1, 5, 6, 7, 8, 9, 10}
+	sortingBank = true
 	Start()
 end
 
@@ -195,9 +226,9 @@ local MOUNTS = set(
 
 local SPECIAL = set(5462, 17696, 17117, 13347, 13289, 11511)
 
-local KEYS = set(9240, 17191, 13544, 12324, 16309, 12384, 20402)
+local KEYS = set(9240, 17191, 13544, 12324, 16309, 12384, 20402, 50545)
 
-local TOOLS = set(7005, 12709, 19727, 5956, 2901, 6219, 10498, 6218, 6339, 11130, 11145, 16207, 9149, 15846, 6256, 6365, 6367)
+local TOOLS = set(7005, 12709, 19727, 5956, 2901, 6219, 10498, 6218, 6339, 11130, 11145, 16207, 9149, 15846, 6256, 6365, 6367, 42004)
 
 local ENCHANTING_MATERIALS = set(
 	-- dust
@@ -386,7 +417,108 @@ do
 	end
 end
 
+-- Lower numbers sit at the start of the sort. Junk is placed separately, at the far end.
+local CATEGORY = {
+	HEARTH = 1,
+	MOUNT = 2,
+	SPECIAL = 3,
+	KEY = 4,
+	TOOL = 5,
+	GEAR = 6,
+	AMMO = 7,
+	POTION = 8,
+	FOOD = 9,
+	BANDAGE = 10,
+	CONSUMABLE = 11,
+	CONJURED = 12,
+	REAGENT = 13,
+	QUEST = 14,
+	HERB = 15,
+	ENCHANT = 16,
+	TRADE = 17,
+	RECIPE = 18,
+	OTHER = 19,
+	JUNK = 20,
+}
+
+local CATEGORY_NAME = {
+	'hearth', 'mount', 'special', 'key', 'tool',
+	'gear', 'ammo', 'potion', 'food', 'bandage',
+	'consumable', 'conjured', 'reagent', 'quest', 'herb',
+	'enchant', 'trade', 'recipe', 'other', 'junk',
+}
+
+-- Item.dbc class ids. Auction class names are the fallback when no id is available.
+local CLASS_CONSUMABLE = 0
+local CLASS_WEAPON = 2
+local CLASS_ARMOR = 4
+local CLASS_REAGENT = 5
+local CLASS_PROJECTILE = 6
+local CLASS_TRADEGOODS = 7
+local CLASS_RECIPE = 9
+local CLASS_QUEST = 12
+
+local AUCTION_CLASS = {
+	[CLASS_CONSUMABLE] = 4,
+	[CLASS_WEAPON] = 1,
+	[CLASS_ARMOR] = 2,
+	[CLASS_REAGENT] = 9,
+	[CLASS_PROJECTILE] = 6,
+	[CLASS_TRADEGOODS] = 5,
+	[CLASS_RECIPE] = 8,
+}
+
+local function IsClass(classID, typeName, wanted)
+	if classID ~= nil then
+		return classID == wanted
+	end
+	local index = AUCTION_CLASS[wanted]
+	return index and typeName == ITEM_TYPES[index]
+end
+
+local function FirstSpellCategory(itemID)
+	if not IsNampowerLoaded() then
+		return
+	end
+	local cats = GetItemStatsField(itemID, 'spellCategory', 1)
+	if type(cats) == 'number' then
+		if cats ~= 0 then
+			return cats
+		end
+		return
+	end
+	if type(cats) ~= 'table' then
+		return
+	end
+	for i = 1, 5 do
+		if cats[i] and cats[i] ~= 0 then
+			return cats[i]
+		end
+	end
+end
+
+-- spellCategory: 4 potion cooldown, 11 food, 59 drink, 150 bandage.
+-- Elixirs and flasks use potion icons but not the potion cooldown.
+local function ConsumableCategory(itemID, texture)
+	local spellCategory = FirstSpellCategory(itemID)
+	if spellCategory == 11 or spellCategory == 59 then
+		return CATEGORY.FOOD, spellCategory
+	end
+	if spellCategory == 150 then
+		return CATEGORY.BANDAGE, spellCategory
+	end
+	local icon = type(texture) == 'string' and strlower(texture) or ''
+	if spellCategory == 4 or strfind(icon, 'inv_potion') then
+		return CATEGORY.POTION, spellCategory
+	end
+	return CATEGORY.CONSUMABLE, spellCategory
+end
+
 local model, itemStacks, itemClasses, itemSortKeys
+
+local CLASSIC_MAX_ROUNDS = 10
+local CLASSIC_TIMEOUT = 15
+local CLASSIC_QUIET = .5
 
 do
 	local f = CreateFrame'Frame'
@@ -394,16 +526,223 @@ do
 
 	local timeout
 	local initialized
+	local state
+	local rounds
+	local startedAt
+	local quietUntil
+	local running
+	local rerun
+	local rerunBudget
+
+	local function Stop()
+		f:UnregisterEvent('BAG_UPDATE_DELAYED')
+		f:UnregisterEvent('ITEM_DATA_LOAD_RESULT')
+		f:UnregisterEvent('ITEM_LOCK_CHANGED')
+		f:UnregisterEvent('BANKFRAME_CLOSED')
+		f:Hide()
+		usingClassicAPI = false
+		sorting = false
+		state = nil
+	end
+
+	local function Report(done)
+		if SortBagsDebug then
+			DEFAULT_CHAT_FRAME:AddMessage(format(
+				'SortBags: %s in %d rounds, %.2fs',
+				done and 'done' or 'incomplete',
+				rounds or 0,
+				GetTime() - (startedAt or GetTime())
+			))
+		end
+		if not done then
+			DEFAULT_CHAT_FRAME:AddMessage('SortBags: sorting incomplete, please run again')
+		end
+		Stop()
+	end
+
+	-- Predicted slot keys use the same identity Item() builds, so a settle
+	-- check can tell a charges/enchant swap from "same item id, already there".
+	local function LiveMatchesModel()
+		for _, slot in model do
+			local info = C_Container.GetContainerItemInfo(slot.container, slot.position)
+			if slot.item == nil then
+				if info then
+					return false
+				end
+			else
+				if not info then
+					return false
+				end
+				-- Same link fields Item() keeps, so enchant/suffix swaps are visible.
+				local _, _, itemID, enchantID, suffixID, uniqueID = strfind(GetContainerItemLink(slot.container, slot.position) or '', 'item:(%d+):(%d*):(%d*):(%d*)')
+				if info.hyperlink then
+					local _, _, _, linkEnchant, linkSuffix, linkUnique = strfind(info.hyperlink, 'item:(%d+):(%d*):(%d*):(%d*)')
+					if linkEnchant and linkEnchant ~= '' then
+						enchantID = linkEnchant
+					end
+					if linkSuffix and linkSuffix ~= '' then
+						suffixID = linkSuffix
+					end
+					if linkUnique and linkUnique ~= '' then
+						uniqueID = linkUnique
+					end
+				end
+				if not itemID then
+					return false
+				end
+				local charges = 1
+				if info.stackCount and info.stackCount > 0 and C_Container.GetContainerItemCharges then
+					local uses = C_Container.GetContainerItemCharges(slot.container, slot.position)
+					if uses then
+						charges = uses / info.stackCount
+					end
+				end
+				if ItemKey(itemID, enchantID, suffixID, uniqueID, charges, info.isBound) ~= slot.item
+					or info.stackCount ~= slot.count then
+					return false
+				end
+			end
+		end
+		return true
+	end
+
+	local Step
+
+	local function FinishStep()
+		running = false
+		-- A cache hit can fire ITEM_DATA_LOAD_RESULT inside Initialize.
+		-- Replay once, but don't spin if the item still isn't readable.
+		if rerun and f:IsShown() and rerunBudget > 0 then
+			rerun = false
+			rerunBudget = rerunBudget - 1
+			Step()
+		end
+	end
+
+	Step = function()
+		if running then
+			rerun = true
+			return
+		end
+		rerun = false
+		running = true
+
+		if GetTime() > timeout then
+			Report(false)
+			FinishStep()
+			return
+		end
+
+		if not Initialize() then
+			state = 'waitdata'
+			FinishStep()
+			return
+		end
+
+		if LayoutComplete() then
+			Report(true)
+			FinishStep()
+			return
+		end
+
+		if rounds >= CLASSIC_MAX_ROUNDS then
+			Report(false)
+			FinishStep()
+			return
+		end
+
+		rounds = rounds + 1
+		local sent = Consolidate()
+		if sent == 0 then
+			sent = Place()
+		end
+		if SortBagsDebug then
+			DEFAULT_CHAT_FRAME:AddMessage(format('SortBags: round %d sent %d', rounds, sent))
+		end
+		if sent == 0 then
+			Report(false)
+		else
+			state = 'settle'
+			quietUntil = GetTime() + CLASSIC_QUIET
+		end
+		FinishStep()
+	end
+
+	-- Only leave 'settle' once. OnEvent and the quiet timer can both
+	-- observe the same round; the second call must not start another.
+	local function NextRound()
+		if state ~= 'settle' then
+			return
+		end
+		quietUntil = nil
+		state = 'run'
+		Step()
+	end
 
 	function Start()
 		if f:IsShown() then return end
+		sorting = true
+		usingClassicAPI = HasClassicAPI()
 		initialized = false
+		if usingClassicAPI then
+			state = 'run'
+			rounds = 0
+			rerunBudget = 8
+			startedAt = GetTime()
+			timeout = GetTime() + CLASSIC_TIMEOUT
+			quietUntil = nil
+			f:RegisterEvent('BAG_UPDATE_DELAYED')
+			f:RegisterEvent('ITEM_DATA_LOAD_RESULT')
+			f:RegisterEvent('ITEM_LOCK_CHANGED')
+			f:RegisterEvent('BANKFRAME_CLOSED')
+			f:Show()
+			Step()
+			return
+		end
 		timeout = GetTime() + 35 * defaultDelay
 		f:Show()
 	end
 
+	f:SetScript('OnEvent', function()
+		if not usingClassicAPI then
+			return
+		end
+		if event == 'BANKFRAME_CLOSED' and sortingBank then
+			if SortBagsDebug then
+				DEFAULT_CHAT_FRAME:AddMessage(format(
+					'SortBags: bank closed after %.2fs',
+					GetTime() - (startedAt or GetTime())
+				))
+			end
+			DEFAULT_CHAT_FRAME:AddMessage('SortBags: bank closed, sorting stopped')
+			Stop()
+			return
+		end
+		if state == 'waitdata' and (event == 'ITEM_DATA_LOAD_RESULT' or event == 'ITEM_LOCK_CHANGED') then
+			Step()
+			return
+		end
+		if state == 'settle' and event == 'BAG_UPDATE_DELAYED' then
+			quietUntil = GetTime() + CLASSIC_QUIET
+			if LiveMatchesModel() then
+				NextRound()
+			end
+		end
+	end)
+
 	local delay = 0
 	f:SetScript('OnUpdate', function()
+		if usingClassicAPI then
+			if GetTime() > timeout then
+				Report(false)
+				return
+			end
+			if state == 'settle' and quietUntil and GetTime() >= quietUntil then
+				NextRound()
+			end
+			return
+		end
+
 		delay = delay - arg1
 		if delay <= 0 then
 			delay = defaultDelay
@@ -412,6 +751,7 @@ do
 				if not Initialize() then
 					if GetTime() > timeout then
 						DEFAULT_CHAT_FRAME:AddMessage('SortBags: sorting incomplete, please run again')
+						sorting = false
 						f:Hide()
 					end
 					return
@@ -421,11 +761,13 @@ do
 
 			local complete = Sort()
 			if complete then
+				sorting = false
 				f:Hide()
 				return
 			end
 			if GetTime() > timeout then
 				DEFAULT_CHAT_FRAME:AddMessage('SortBags: sorting incomplete, please run again')
+				sorting = false
 				f:Hide()
 				return
 			end
@@ -443,16 +785,32 @@ do
 		end
 	end
 
+	local typeKeys, subTypeKeys, invTypeKeys = {}, {}, {}
+
 	function ItemTypeKey(itemClass)
-		return key(ITEM_TYPES, itemClass) or 0
+		if not itemClass or itemClass == '' then
+			return 0
+		end
+		if typeKeys[itemClass] == nil then
+			typeKeys[itemClass] = key(ITEM_TYPES, itemClass) or 0
+		end
+		return typeKeys[itemClass]
 	end
 
 	function ItemSubTypeKey(itemClass, itemSubClass)
-		return key({GetAuctionItemSubClasses(ItemTypeKey(itemClass))}, itemSubClass) or 0
+		local cacheKey = (itemClass or '') .. '\0' .. (itemSubClass or '')
+		if subTypeKeys[cacheKey] == nil then
+			subTypeKeys[cacheKey] = key({GetAuctionItemSubClasses(ItemTypeKey(itemClass))}, itemSubClass) or 0
+		end
+		return subTypeKeys[cacheKey]
 	end
 
 	function ItemInvTypeKey(itemClass, itemSubClass, itemSlot)
-		return key({GetAuctionInvTypes(ItemTypeKey(itemClass), ItemSubTypeKey(itemClass, itemSubClass))}, itemSlot) or 0
+		local cacheKey = (itemClass or '') .. '\0' .. (itemSubClass or '') .. '\0' .. (itemSlot or '')
+		if invTypeKeys[cacheKey] == nil then
+			invTypeKeys[cacheKey] = key({GetAuctionInvTypes(ItemTypeKey(itemClass), ItemSubTypeKey(itemClass, itemSubClass))}, itemSlot) or 0
+		end
+		return invTypeKeys[cacheKey]
 	end
 end
 
@@ -641,6 +999,148 @@ function Stack()
 	end
 end
 
+function LayoutComplete()
+	for _, dst in model do
+		if dst.targetItem and (dst.item ~= dst.targetItem or dst.count < dst.targetCount) then
+			return false
+		end
+	end
+	return true
+end
+
+-- SwapItems/MoveItem resolve the source against client state, which stays
+-- at the pre-batch snapshot until the server replies. A slot is only a
+-- valid source while the model still matches that snapshot.
+local function sameAsLive(slot)
+	return slot.item == slot.liveItem and slot.count == slot.liveCount
+end
+
+local function sourceFresh(slot)
+	return slot.item and slot.liveOccupied and sameAsLive(slot)
+end
+
+function MoveBatch(src, dst, count)
+	if src == dst or not src.item then
+		return
+	end
+
+	if src.item == dst.item then
+		if not sourceFresh(src) or dst.liveItem ~= src.item or dst.item ~= src.item then
+			return
+		end
+		local space = itemStacks[dst.item] - dst.count
+		if not count then
+			count = min(src.count, space)
+		end
+		count = min(count, space, src.count)
+		if count < 1 then
+			return
+		end
+		-- A full-stack MoveItem reads the live count and is rejected once an
+		-- earlier packet in this batch has already emptied that stack.
+		local ok
+		if count >= src.count then
+			ok = C_Container.SwapItems(src.container, src.position, dst.container, dst.position)
+		else
+			ok = C_Container.MoveItem(src.container, src.position, dst.container, dst.position, count)
+		end
+		if not ok then
+			return
+		end
+		src.count = src.count - count
+		dst.count = dst.count + count
+		if src.count == 0 then
+			src.item = nil
+		end
+		return true
+	end
+
+	if not sourceFresh(src) or not sameAsLive(dst) then
+		return
+	end
+	local ok = C_Container.SwapItems(src.container, src.position, dst.container, dst.position)
+	if not ok and sourceFresh(dst) then
+		ok = C_Container.SwapItems(dst.container, dst.position, src.container, src.position)
+	end
+	if not ok then
+		return
+	end
+	src.item, dst.item = dst.item, src.item
+	src.count, dst.count = dst.count, src.count
+	return true
+end
+
+function Place()
+	local sent = 0
+
+	for _, dst in model do
+		if dst.targetItem and (dst.item ~= dst.targetItem or dst.count < dst.targetCount) then
+			local sources, rank = {}, {}
+
+			for _, src in model do
+				if src.item == dst.targetItem
+					and src ~= dst
+					and not (dst.item and src.class and src.class ~= itemClasses[dst.item])
+					and not (src.targetItem and src.item == src.targetItem and src.count <= src.targetCount)
+				then
+					rank[src] = abs(src.count - dst.targetCount + (dst.item == dst.targetItem and dst.count or 0))
+					tinsert(sources, src)
+				end
+			end
+
+			sort(sources, function(a, b) return rank[a] < rank[b] end)
+
+			for _, src in sources do
+				if MoveBatch(src, dst) then
+					sent = sent + 1
+					break
+				end
+			end
+		end
+	end
+
+	return sent
+end
+
+function Consolidate()
+	local groups = {}
+	for _, slot in model do
+		if slot.item and slot.count < itemStacks[slot.item] then
+			if not groups[slot.item] then
+				groups[slot.item] = {}
+			end
+			tinsert(groups[slot.item], slot)
+		end
+	end
+
+	local sent = 0
+	for _, stacks in groups do
+		if table.getn(stacks) >= 2 then
+			sort(stacks, function(a, b)
+				return a.count > b.count
+			end)
+			local lo, hi = 1, table.getn(stacks)
+			while lo < hi do
+				local dst, src = stacks[lo], stacks[hi]
+				local space = itemStacks[dst.item] - dst.count
+				if space <= 0 then
+					lo = lo + 1
+				elseif MoveBatch(src, dst, min(space, src.count)) then
+					sent = sent + 1
+					if src.count == 0 then
+						hi = hi - 1
+					else
+						lo = lo + 1
+					end
+				else
+					hi = hi - 1
+				end
+			end
+		end
+	end
+	return sent
+end
+
 do
 	local counts
 
@@ -673,11 +1173,21 @@ do
 
 		for _, container in CONTAINERS do
 			local class = ContainerClass(container)
+			if class == false then
+				return false
+			end
 			for position = 1, GetContainerNumSlots(container) do
 				local slot = {container=container, position=position, class=class}
-				local texture, _, locked = GetContainerItemInfo(container, position)
-				if texture and locked then
-					return false
+				if usingClassicAPI then
+					local info = C_Container.GetContainerItemInfo(container, position)
+					if info and info.isLocked then
+						return false
+					end
+				else
+					local texture, _, locked = GetContainerItemInfo(container, position)
+					if texture and locked then
+						return false
+					end
 				end
 				local item = Item(container, position)
 				if item == false then
@@ -689,6 +1199,9 @@ do
 					slot.count = count
 					counts[item] = (counts[item] or 0) + count
 				end
+				slot.liveItem = slot.item
+				slot.liveCount = slot.count
+				slot.liveOccupied = slot.item ~= nil
 				insert(model, slot)
 			end
 		end
@@ -713,20 +1226,56 @@ do
 		end
 		sort(items, function(a, b) return LT(itemSortKeys[a], itemSortKeys[b]) end)
 
-		for _, slot in model do
-			if slot.class then
-				for _, item in items do
-					if itemClasses[item] == slot.class and assign(slot, item) then
-						break
-					end
-				end
+		-- Junk with no specialty bag sits at the far end of the sort.
+		-- Empty slots stay between the other items and the junk.
+		local normal, junk = {}, {}
+		for _, item in items do
+			if itemSortKeys[item][1] == CATEGORY.JUNK and not itemClasses[item] then
+				tinsert(junk, item)
 			else
-				for _, item in items do
-					if (not itemClasses[item] or free[itemClasses[item]] > 0) and assign(slot, item) then
-						if itemClasses[item] then
-							free[itemClasses[item]] = free[itemClasses[item]] - 1
+				tinsert(normal, item)
+			end
+		end
+
+		local generic = {}
+		for _, slot in model do
+			if not slot.class then
+				tinsert(generic, slot)
+			end
+		end
+		local junkSlots = 0
+		for _, item in junk do
+			junkSlots = junkSlots + ceil(counts[item] / itemStacks[item])
+		end
+		local firstJunk = table.getn(generic) - junkSlots + 1
+		if firstJunk < 1 then
+			firstJunk = 1
+		end
+		for i = firstJunk, table.getn(generic) do
+			local slot = generic[i]
+			for _, item in junk do
+				if assign(slot, item) then
+					break
+				end
+			end
+		end
+
+		for _, slot in model do
+			if not slot.targetItem then
+				if slot.class then
+					for _, item in normal do
+						if itemClasses[item] == slot.class and assign(slot, item) then
+							break
 						end
-						break
+					end
+				else
+					for _, item in normal do
+						if (not itemClasses[item] or free[itemClasses[item]] > 0) and assign(slot, item) then
+							if itemClasses[item] then
+								free[itemClasses[item]] = free[itemClasses[item]] - 1
+							end
+							break
+						end
 					end
 				end
 			end
@@ -738,6 +1287,30 @@ end
 
 function ContainerClass(container)
 	if container ~= 0 and container ~= BANK_CONTAINER then
+		if usingClassicAPI then
+			local invID = ContainerIDToInventoryID(container)
+			local bagLink = invID and GetInventoryItemLink('player', invID)
+			if not bagLink then
+				return
+			end
+			local _, _, bagItemID = strfind(bagLink, 'item:(%d+)')
+			bagItemID = tonumber(bagItemID)
+			local family = C_Item.GetItemFamily(bagItemID or bagLink)
+			if family == nil then
+				if bagItemID and C_Item.GetItemDataByID(bagItemID) then
+					family = 0
+				else
+					if bagItemID and C_Item.RequestLoadItemDataByID then
+						C_Item.RequestLoadItemDataByID(bagItemID)
+					end
+					return false
+				end
+			end
+			if family ~= 0 then
+				return family
+			end
+			return
+		end
 		if IsNampowerLoaded() then
 			local invID = ContainerIDToInventoryID(container)
 			local bagLink = invID and GetInventoryItemLink('player', invID)
@@ -770,101 +1343,186 @@ function Item(container, position)
 	if link then
 		local _, _, itemID, enchantID, suffixID, uniqueID = strfind(link, 'item:(%d+):(%d*):(%d*):(%d*)')
 		itemID = tonumber(itemID)
-		local name, _, quality, _, type, subType, stack, invType = GetItemInfo(itemID)
-		if not name then
+		if not itemID then
 			return false
 		end
 
+		local name, quality, type, subType, stack, invType
 		local charges, usable, soulbound, quest, conjured
-		local bagItem = SnapshotBagItem(container, position)
-		if bagItem then
-			charges, usable, soulbound, quest, conjured = NampowerItemInfo(bagItem, itemID)
-			if (not enchantID or enchantID == '') and bagItem.permanentEnchantId and bagItem.permanentEnchantId ~= 0 then
-				enchantID = tostring(bagItem.permanentEnchantId)
+		local classID
+
+		if usingClassicAPI then
+			local info = C_Container.GetContainerItemInfo(container, position)
+			if info and info.hyperlink then
+				local _, _, _, linkEnchant, linkSuffix, linkUnique = strfind(info.hyperlink, 'item:(%d+):(%d*):(%d*):(%d*)')
+				if linkEnchant and linkEnchant ~= '' then
+					enchantID = linkEnchant
+				end
+				if linkSuffix and linkSuffix ~= '' then
+					suffixID = linkSuffix
+				end
+				if linkUnique and linkUnique ~= '' then
+					uniqueID = linkUnique
+				end
 			end
-			if (not suffixID or suffixID == '') and bagItem.randomPropertiesId and bagItem.randomPropertiesId ~= 0 then
-				suffixID = tostring(bagItem.randomPropertiesId)
+
+			local data = C_Item.GetItemDataByID(itemID)
+			if not data or not data.name then
+				if C_Item.RequestLoadItemDataByID then
+					C_Item.RequestLoadItemDataByID(itemID)
+				end
+				return false
+			end
+
+			name = data.name
+			quality = data.quality or 0
+			type = data.className
+			subType = data.subclassName
+			stack = data.maxStackSize
+			if not stack or stack < 1 then
+				stack = 1
+			end
+			classID = data.classID
+			if data.equipLoc and data.equipLoc ~= '' then
+				invType = getglobal(data.equipLoc)
+			end
+			soulbound = info and info.isBound
+			quest = data.bindType == 4 or data.bindType == 5
+			conjured = data.isConjured
+			if C_Item.GetItemSpell then
+				usable = C_Item.GetItemSpell(itemID) ~= nil
+			end
+			charges = 1
+			if info and info.stackCount and info.stackCount > 0 and C_Container.GetContainerItemCharges then
+				local uses = C_Container.GetContainerItemCharges(container, position)
+				if uses then
+					charges = uses / info.stackCount
+				end
 			end
 		else
-			charges, usable, soulbound, quest, conjured = TooltipInfo(container, position)
+			local infoName, _, infoQuality, _, infoType, infoSubType, infoStack, infoInvType = GetItemInfo(itemID)
+			name, quality, type, subType, stack, invType = infoName, infoQuality, infoType, infoSubType, infoStack, infoInvType
+			if not name then
+				return false
+			end
+
+			local bagItem = SnapshotBagItem(container, position)
+			if bagItem then
+				charges, usable, soulbound, quest, conjured = NampowerItemInfo(bagItem, itemID)
+				if (not enchantID or enchantID == '') and bagItem.permanentEnchantId and bagItem.permanentEnchantId ~= 0 then
+					enchantID = tostring(bagItem.permanentEnchantId)
+				end
+				if (not suffixID or suffixID == '') and bagItem.randomPropertiesId and bagItem.randomPropertiesId ~= 0 then
+					suffixID = tostring(bagItem.randomPropertiesId)
+				end
+			else
+				charges, usable, soulbound, quest, conjured = TooltipInfo(container, position)
+			end
 		end
+		if classID == nil and IsNampowerLoaded() then
+			classID = tonumber(GetItemStatsField(itemID, 'class'))
+		end
+		local family
+		if IsNampowerLoaded() then
+			family = GetNampowerItemFamily(itemID)
+		end
+		local texture = GetContainerItemInfo(container, position)
 		local outfitInfo = LookupOutfitSort(itemID, enchantID, suffixID)
 
+		local isWeapon = IsClass(classID, type, CLASS_WEAPON)
+		local isArmor = IsClass(classID, type, CLASS_ARMOR)
+		local isRecipe = IsClass(classID, type, CLASS_RECIPE)
+		local category
+		local spellCategory
 		local sortKey = {}
 
 		-- hearthstone and related
 		if itemID == 6948 or itemID == 41915 or itemID == 61000 then
-			tinsert(sortKey, 1)
+			category = CATEGORY.HEARTH
 			tinsert(sortKey, itemID)
 
 		-- mounts
 		elseif MOUNTS[itemID] then
-			tinsert(sortKey, 2)
+			category = CATEGORY.MOUNT
 
 		-- special items
 		elseif SPECIAL[itemID] then
-			tinsert(sortKey, 3)
+			category = CATEGORY.SPECIAL
 
 		-- key items
 		elseif KEYS[itemID] then
-			tinsert(sortKey, 4)
+			category = CATEGORY.KEY
 
 		-- tools
 		elseif TOOLS[itemID] then
-			tinsert(sortKey, 5)
+			category = CATEGORY.TOOL
 
-		-- soul shards
+		-- soul shards sit with class reagents
 		elseif itemID == 6265 then
-			tinsert(sortKey, 14)
-
-		-- conjured items
-		elseif conjured then
-			tinsert(sortKey, 15)
-
-		-- Outfitter outfit items
-		elseif outfitInfo then
-			tinsert(sortKey, 6)
-			tinsert(sortKey, outfitInfo[1])
-			tinsert(sortKey, outfitInfo[2])
-
-		-- soulbound items
-		elseif soulbound then
-			tinsert(sortKey, 6)
-			tinsert(sortKey, 10000)
-
-		-- reagents
-		elseif type == ITEM_TYPES[9] then
-			tinsert(sortKey, 7)
+			category = CATEGORY.REAGENT
 
 		-- quest items
-		elseif quest then
-			tinsert(sortKey, 9)
-
-		-- consumables
-		elseif usable and type ~= ITEM_TYPES[1] and type ~= ITEM_TYPES[2] and type ~= ITEM_TYPES[8] or type == ITEM_TYPES[4] then
-			tinsert(sortKey, 8)
-
-		-- enchanting materials
-		elseif ENCHANTING_MATERIALS[itemID] then
-			tinsert(sortKey, 11)
-
-		-- herbs
-		elseif HERBS[itemID] then
-			tinsert(sortKey, 12)
-
-		-- higher quality
-		elseif quality > 1 then
-			tinsert(sortKey, 10)
-
-		-- common quality
-		elseif quality == 1 then
-			tinsert(sortKey, 13)
+		elseif quest or IsClass(classID, type, CLASS_QUEST) then
+			category = CATEGORY.QUEST
 
 		-- junk
 		elseif quality == 0 then
-			tinsert(sortKey, 14)
+			category = CATEGORY.JUNK
+
+		-- conjured items
+		elseif conjured then
+			category = CATEGORY.CONJURED
+
+		-- Outfitter outfit items, then bound gear, then the rest
+		elseif outfitInfo then
+			category = CATEGORY.GEAR
+			tinsert(sortKey, 1)
+			tinsert(sortKey, outfitInfo[1])
+			tinsert(sortKey, outfitInfo[2])
+
+		elseif isWeapon or isArmor then
+			category = CATEGORY.GEAR
+			tinsert(sortKey, soulbound and 2 or 3)
+
+		-- ammo
+		elseif IsClass(classID, type, CLASS_PROJECTILE) then
+			category = CATEGORY.AMMO
+
+		-- reagents, including druid seeds
+		elseif IsClass(classID, type, CLASS_REAGENT) or SEEDS[itemID] then
+			category = CATEGORY.REAGENT
+
+		-- consumables, plus usable items that are not gear or recipes
+		elseif IsClass(classID, type, CLASS_CONSUMABLE) or (usable and not isWeapon and not isArmor and not isRecipe) then
+			category, spellCategory = ConsumableCategory(itemID, texture)
+			if category == CATEGORY.POTION then
+				tinsert(sortKey, spellCategory == 4 and 1 or 2)
+			elseif category == CATEGORY.FOOD and spellCategory then
+				tinsert(sortKey, spellCategory)
+			end
+
+		-- herbs, including turtle herbs that fit a herb bag
+		elseif HERBS[itemID] or family == 6 then
+			category = CATEGORY.HERB
+
+		-- enchanting dust, essence, shards, crystals
+		elseif ENCHANTING_MATERIALS[itemID] or family == 7 then
+			category = CATEGORY.ENCHANT
+
+		-- other profession materials, clustered by bag family
+		elseif IsClass(classID, type, CLASS_TRADEGOODS) then
+			category = CATEGORY.TRADE
+			tinsert(sortKey, family or 0)
+
+		-- recipes
+		elseif isRecipe then
+			category = CATEGORY.RECIPE
+
+		else
+			category = CATEGORY.OTHER
 		end
 
+		tinsert(sortKey, 1, category)
 		tinsert(sortKey, ItemTypeKey(type))
 		tinsert(sortKey, ItemInvTypeKey(type, subType, invType))
 		tinsert(sortKey, ItemSubTypeKey(type, subType))
@@ -875,18 +1533,27 @@ function Item(container, position)
 		tinsert(sortKey, enchantID)
 		tinsert(sortKey, uniqueID)
 
-		local key = format('%s:%s:%s:%s:%s:%s', itemID, enchantID, suffixID, uniqueID, charges, (soulbound and 1 or 0))
+		local key = ItemKey(itemID, enchantID, suffixID, uniqueID, charges, soulbound)
 
 		itemStacks[key] = stack
 		itemSortKeys[key] = sortKey
 
-		if IsNampowerLoaded() then
+		if usingClassicAPI then
+			-- Containers and quivers are bags you carry, not items that
+			-- belong inside a specialty bag of the same family.
+			if classID ~= 1 and classID ~= 11 then
+				local family = C_Item.GetItemFamily(itemID)
+				if family and family ~= 0 then
+					itemClasses[key] = family
+				end
+			end
+		elseif IsNampowerLoaded() then
 			local family = GetNampowerItemFamily(itemID)
 			if family then
 				itemClasses[key] = family
 			end
 		end
-		if not itemClasses[key] then
+		if not itemClasses[key] and not usingClassicAPI then
 			for class, info in CLASSES do
 				if info.items[itemID] then
 					if IsNampowerLoaded() then
@@ -900,5 +1567,49 @@ function Item(container, position)
 		end
 
 		return key
+	end
+end
+
+function _G.SortBagsDump()
+	if sorting then
+		DEFAULT_CHAT_FRAME:AddMessage('SortBags: sorting in progress')
+		return
+	end
+
+	local savedClassic = usingClassicAPI
+	local savedStacks = itemStacks
+	local savedClasses = itemClasses
+	local savedKeys = itemSortKeys
+
+	local function restore()
+		usingClassicAPI = savedClassic
+		itemStacks = savedStacks
+		itemClasses = savedClasses
+		itemSortKeys = savedKeys
+	end
+
+	usingClassicAPI = HasClassicAPI()
+	itemStacks, itemClasses, itemSortKeys = {}, {}, {}
+
+	local ok, err = pcall(function()
+		BuildOutfitSortMap()
+		for _, container in {0, 1, 2, 3, 4} do
+			for position = 1, GetContainerNumSlots(container) do
+				local link = GetContainerItemLink(container, position)
+				if link then
+					local key = Item(container, position)
+					local name = 'unloaded'
+					if key and itemSortKeys[key] then
+						name = CATEGORY_NAME[itemSortKeys[key][1]] or '?'
+					end
+					DEFAULT_CHAT_FRAME:AddMessage(link .. ' -> ' .. name)
+				end
+			end
+		end
+	end)
+
+	restore()
+	if not ok then
+		DEFAULT_CHAT_FRAME:AddMessage('SortBags: dump failed: ' .. tostring(err))
 	end
 end
